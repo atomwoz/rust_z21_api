@@ -1,3 +1,6 @@
+use std::time::Duration;
+
+use tokio::time;
 use z21_api::Z21Station;
 
 #[tokio::main]
@@ -11,14 +14,12 @@ async fn main() -> std::io::Result<()> {
         Err(e) => eprintln!("Error: {:?}", e),
     }
 
-    station
-        .subscribe_to_system_state(|x| {
-            println!("System state: {:?}", x);
-        })
-        .expect("Failed to subscribe to system state");
+    loop {
+        station.voltage_off().await?;
+        time::sleep(Duration::from_millis(1500)).await;
+        station.voltage_on().await?;
+        time::sleep(Duration::from_millis(1500)).await;
+    }
 
-    let status = station.get_system_status().await?;
-    println!("System status: {:?}", status);
-    tokio::time::sleep(std::time::Duration::from_secs(100000000000)).await;
-    Ok(())
+    //Ok(())
 }

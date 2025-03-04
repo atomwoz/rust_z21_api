@@ -11,7 +11,7 @@
 //!   and logging out.
 //! - The UDP socket is wrapped in an `Arc` for safe sharing across asynchronous tasks.
 
-use crate::messages::SystemState;
+use crate::messages::{self, SystemState, XBusMessage};
 use crate::packet::Packet;
 use std::convert::TryFrom;
 use std::io;
@@ -24,8 +24,12 @@ use tokio::time::timeout;
 
 /// The header value for the LAN_SYSTEMSTATE_DATACHANGED event.
 const LAN_SYSTEMSTATE_DATACHANGED: u16 = 0x8400;
+const X_SET_TRACK_POWER_OFF: (u8, u8) = (0x21, 0x80);
+const X_SET_TRACK_POWER_ON: (u8, u8) = (0x21, 0x81);
+const X_BC_TRACK_POWER: u8 = 0x61;
+
 /// Default timeout in milliseconds for awaiting responses.
-const DEFAULT_TIMEOUT_MS: u64 = 3000;
+const DEFAULT_TIMEOUT_MS: u64 = 2500;
 
 /// Represents an asynchronous connection to a Z21 station.
 ///
@@ -127,6 +131,21 @@ impl Z21Station {
         Ok(())
     }
 
+    async fn send_xbus_packet(
+        &self,
+        xbus_message: XBusMessage,
+        expected_response_xbus_header: Option<u8>,
+    ) -> io::Result<XBusMessage> {
+        let x_header = xbus_message.get_x_header();
+        let data: Vec<u8> = xbus_message.into();
+        let packet = Packet::with_header_and_data(messages::XBUS_HEADER, &data);
+        self.send_packet(packet).await?;
+
+        let expected_header = expected_response_xbus_header.unwrap_or(x_header);
+        let xbus_return = self.receive_xbus_packet(expected_header).await?;
+        Ok(xbus_return)
+    }
+
     /// Asynchronously waits for a packet with the specified header.
     ///
     /// This function listens on the internal broadcast channel and filters incoming packets,
@@ -141,17 +160,67 @@ impl Z21Station {
     /// Returns an `io::Error` if the broadcast channel is closed or an error occurs while receiving.
     async fn receive_packet_with_header(&self, header: u16) -> io::Result<Packet> {
         let mut msg_rcv = self.message_receiver.resubscribe();
-        loop {
-            match msg_rcv.recv().await {
-                Ok(packet) => {
-                    if packet.get_header() == header {
-                        return Ok(packet);
+        match timeout(self.timeout, async {
+            loop {
+                match msg_rcv.recv().await {
+                    Ok(packet) => {
+                        if packet.get_header() == header {
+                            return Ok(packet);
+                        }
+                    }
+                    Err(_) => {
+                        return Err(io::Error::new(io::ErrorKind::Other, "Channel closed"));
                     }
                 }
-                Err(_) => {
-                    return Err(io::Error::new(io::ErrorKind::Other, "Channel closed"));
+            }
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("Timeout waiting for packet with header 0x{:04x}", header),
+            )),
+        }
+    }
+
+    async fn receive_xbus_packet(&self, expected_xbus_header: u8) -> io::Result<XBusMessage> {
+        let mut msg_rcv = self.message_receiver.resubscribe();
+        match timeout(self.timeout, async {
+            loop {
+                match msg_rcv.recv().await {
+                    Ok(packet) => {
+                        if packet.get_header() == messages::XBUS_HEADER {
+                            let end_payload = packet.get_data_len() as isize - 4;
+                            if end_payload <= 0 {
+                                continue;
+                            }
+                            let end_payload = end_payload as usize;
+                            let payload = &packet.get_data()[0..end_payload];
+                            let xbus_msg = XBusMessage::try_from(payload);
+                            if let Ok(msg) = xbus_msg {
+                                if msg.get_x_header() == expected_xbus_header {
+                                    return Ok(msg);
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        return Err(io::Error::new(io::ErrorKind::Other, "Channel closed"));
+                    }
                 }
             }
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "Timeout waiting for XBus message with header 0x{:02x}",
+                    expected_xbus_header
+                ),
+            )),
         }
     }
 
@@ -164,9 +233,19 @@ impl Z21Station {
     /// Returns an `io::Error` if the broadcast channel is closed.
     async fn receive_packet(&self) -> io::Result<Packet> {
         let mut msg_rcv = self.message_receiver.resubscribe();
-        match msg_rcv.recv().await {
-            Ok(packet) => Ok(packet),
-            Err(_) => Err(io::Error::new(io::ErrorKind::Other, "Channel closed")),
+        match timeout(self.timeout, async {
+            match msg_rcv.recv().await {
+                Ok(packet) => Ok(packet),
+                Err(_) => Err(io::Error::new(io::ErrorKind::Other, "Channel closed")),
+            }
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Timeout waiting for packet",
+            )),
         }
     }
 
@@ -176,8 +255,21 @@ impl Z21Station {
     ///
     /// Returns an `io::Error` if the command packet fails to send.
     pub async fn voltage_off(&self) -> io::Result<()> {
-        let packet = Packet::with_header_and_data(0x40, &[0x21, 0x80, 0xa1]);
-        self.send_packet(packet).await
+        self.send_xbus_packet(
+            XBusMessage::new_single(X_SET_TRACK_POWER_OFF.0, X_SET_TRACK_POWER_OFF.1),
+            Some(X_BC_TRACK_POWER),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn voltage_on(&self) -> io::Result<()> {
+        self.send_xbus_packet(
+            XBusMessage::new_single(X_SET_TRACK_POWER_ON.0, X_SET_TRACK_POWER_ON.1),
+            Some(X_BC_TRACK_POWER),
+        )
+        .await?;
+        Ok(())
     }
 
     /// Retrieves the serial number from the Z21 station as 32-bit unsigned integer.
