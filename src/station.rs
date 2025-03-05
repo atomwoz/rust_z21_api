@@ -22,6 +22,10 @@ use tokio::net::UdpSocket;
 use tokio::sync::broadcast;
 use tokio::time::timeout;
 
+mod loco;
+pub use loco::DccThrottleSteps;
+pub use loco::Loco;
+
 /// The header value for the LAN_SYSTEMSTATE_DATACHANGED event.
 const LAN_SYSTEMSTATE_DATACHANGED: u16 = 0x8400;
 const X_SET_TRACK_POWER_OFF: (u8, u8) = (0x21, 0x80);
@@ -29,7 +33,7 @@ const X_SET_TRACK_POWER_ON: (u8, u8) = (0x21, 0x81);
 const X_BC_TRACK_POWER: u8 = 0x61;
 
 /// Default timeout in milliseconds for awaiting responses.
-const DEFAULT_TIMEOUT_MS: u64 = 2500;
+const DEFAULT_TIMEOUT_MS: u64 = 2000;
 
 /// Represents an asynchronous connection to a Z21 station.
 ///
@@ -131,15 +135,41 @@ impl Z21Station {
         Ok(())
     }
 
-    async fn send_xbus_packet(
+    /// Sends an XBus packet without waiting for a response
+    ///
+    /// # Arguments
+    ///
+    /// * `xbus_message` - The XBus message to send
+    ///
+    /// # Errors
+    ///
+    /// Returns an `io::Error` if the packet fails to send
+    async fn send_xbus_packet(&self, xbus_message: XBusMessage) -> io::Result<()> {
+        let data: Vec<u8> = xbus_message.into();
+        let packet = Packet::with_header_and_data(messages::XBUS_HEADER, &data);
+        self.send_packet(packet).await
+    }
+
+    /// Sends an XBus command and waits for the expected response
+    ///
+    /// # Arguments
+    ///
+    /// * `xbus_message` - The XBus message to send
+    /// * `expected_response_xbus_header` - Optional expected response header. If None, uses the sent message header
+    ///
+    /// # Errors
+    ///
+    /// Returns an `io::Error` if:
+    /// - The packet fails to send
+    /// - No response is received within the timeout period
+    /// - The response has an invalid format
+    async fn send_xbus_command(
         &self,
         xbus_message: XBusMessage,
         expected_response_xbus_header: Option<u8>,
     ) -> io::Result<XBusMessage> {
         let x_header = xbus_message.get_x_header();
-        let data: Vec<u8> = xbus_message.into();
-        let packet = Packet::with_header_and_data(messages::XBUS_HEADER, &data);
-        self.send_packet(packet).await?;
+        self.send_xbus_packet(xbus_message).await?;
 
         let expected_header = expected_response_xbus_header.unwrap_or(x_header);
         let xbus_return = self.receive_xbus_packet(expected_header).await?;
@@ -255,7 +285,7 @@ impl Z21Station {
     ///
     /// Returns an `io::Error` if the command packet fails to send.
     pub async fn voltage_off(&self) -> io::Result<()> {
-        self.send_xbus_packet(
+        self.send_xbus_command(
             XBusMessage::new_single(X_SET_TRACK_POWER_OFF.0, X_SET_TRACK_POWER_OFF.1),
             Some(X_BC_TRACK_POWER),
         )
@@ -264,7 +294,7 @@ impl Z21Station {
     }
 
     pub async fn voltage_on(&self) -> io::Result<()> {
-        self.send_xbus_packet(
+        self.send_xbus_command(
             XBusMessage::new_single(X_SET_TRACK_POWER_ON.0, X_SET_TRACK_POWER_ON.1),
             Some(X_BC_TRACK_POWER),
         )

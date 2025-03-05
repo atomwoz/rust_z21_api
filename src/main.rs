@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use tokio::time;
-use z21_api::Z21Station;
+use z21_api::{Loco, Z21Station};
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -14,10 +14,16 @@ async fn main() -> std::io::Result<()> {
         Err(e) => eprintln!("Error: {:?}", e),
     }
 
+    let rag_loco = Loco::control(&station, 4).await?;
+
     loop {
-        station.voltage_off().await?;
+        rag_loco.drive(25.).await?;
         time::sleep(Duration::from_millis(1500)).await;
-        station.voltage_on().await?;
+        rag_loco.halt().await?;
+        time::sleep(Duration::from_millis(1500)).await;
+        rag_loco.drive(-25.).await?;
+        time::sleep(Duration::from_millis(1500)).await;
+        rag_loco.halt().await?;
         time::sleep(Duration::from_millis(1500)).await;
     }
 

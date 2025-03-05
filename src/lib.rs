@@ -13,5 +13,6 @@
 
 mod packet;
 mod station;
+pub use station::Loco;
 pub use station::Z21Station;
 pub mod messages;
