@@ -38,9 +38,8 @@ const DEFAULT_TIMEOUT_MS: u64 = 2000;
 /// Represents an asynchronous connection to a Z21 station.
 ///
 /// The `Z21Station` manages a UDP socket for communication with a Z21 station. It spawns a
-/// background task to continuously listen for incoming packets and broadcasts these packets
-/// over an internal channel. Clients can subscribe to specific events by filtering packets based on
-/// their header values.
+/// background task to continuously listen for incoming packets and proceed these packets
+/// over an internal logic.
 pub struct Z21Station {
     socket: Arc<UdpSocket>,
     message_sender: broadcast::Sender<Packet>,
@@ -293,6 +292,11 @@ impl Z21Station {
         Ok(())
     }
 
+    /// Turns on the track voltage - turning off programming mode, and disabling EMERG STOP from MultiMaus or button on Z21.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `io::Error` if the command packet fails to send.
     pub async fn voltage_on(&self) -> io::Result<()> {
         self.send_xbus_command(
             XBusMessage::new_single(X_SET_TRACK_POWER_ON.0, X_SET_TRACK_POWER_ON.1),

@@ -20,7 +20,7 @@ impl Default for DccThrottleSteps {
         Self::Steps128
     }
 }
-
+/// Represents DCC Locomotive.
 pub struct Loco<'a> {
     station: &'a Z21Station,
     addr: u16,
@@ -28,9 +28,13 @@ pub struct Loco<'a> {
 }
 
 impl<'a> Loco<'a> {
+    /// Initializing control over loco with specified address.  
+    /// It also subscribes info about it.
     pub async fn control(station: &Z21Station, address: u16) -> io::Result<Loco> {
         Self::control_with_steps(station, address, DccThrottleSteps::default()).await
     }
+    /// Initializing control over loco with specified address and DCC stepping.  
+    /// It also subscribes info about it.
     pub async fn control_with_steps(
         station: &Z21Station,
         address: u16,
@@ -58,11 +62,18 @@ impl<'a> Loco<'a> {
             .await?;
         Ok(())
     }
-    //Normal stop speed=0, braking with braking curve
+    /// Normal loco stop, equivalent to setting speed to 0.  
+    /// It applies braking with a braking curve.  
+    ///
+    /// # Errors
+    /// Returns an `io::Error` if the packet fails to send, or Z21 does not respond.  
     pub async fn stop(&self) -> io::Result<()> {
         self.send_drive(0x0).await
     }
-    //Stops train emergency (in place)
+    /// Stops the train immediately (emergency stop).
+    ///
+    /// # Errors
+    /// Returns an `io::Error` if the packet fails to send, or Z21 does not respond.  
     pub async fn halt(&self) -> io::Result<()> {
         self.send_drive(0x1).await
     }
@@ -79,7 +90,21 @@ impl<'a> Loco<'a> {
         let to_out = (mapped_speed.abs() as u8) | (0x80 * flag as u8);
         to_out
     }
-    //pub async fn subscribe_to
+    /// Sets speed of the locomotive in percent.  
+    /// It is automatically calculated based on the number of steps.  
+    /// When the speed is positive, the locomotive moves forward.  
+    /// When the speed is negative, the locomotive moves backward.  
+    /// When setting the speed to 0, the locomotive stops using a braking curve.  
+    /// To stop the locomotive immediately, use the `halt` method.  
+    ///
+    /// # Errors
+    /// Returns an `io::Error` if the packet fails to send, or Z21 does not respond.
+    ///
+    /// # Example
+    /// For example, to drive forward at 50% speed:
+    /// ```rust
+    /// loco.drive(50.0).await?;
+    /// ```
     pub async fn drive(&self, speed_percent: f64) -> io::Result<()> {
         let calced = Self::calc_speed(self.steps, speed_percent);
         self.send_drive(calced).await?;
