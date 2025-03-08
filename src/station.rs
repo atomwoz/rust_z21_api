@@ -16,24 +16,29 @@ use crate::packet::Packet;
 use std::convert::TryFrom;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::broadcast;
-use tokio::time::timeout;
+use tokio::time::{self, timeout};
 
 mod loco;
-pub use loco::DccThrottleSteps;
 pub use loco::Loco;
 
 /// The header value for the LAN_SYSTEMSTATE_DATACHANGED event.
-const LAN_SYSTEMSTATE_DATACHANGED: u16 = 0x8400;
+const LAN_SYSTEMSTATE_DATACHANGED: u16 = 0x84;
+const LAN_SET_BROADCASTFLAGS: u16 = 0x50;
+const LAN_SYSTEMSTATE_GETDATA: u16 = 0x85;
 const X_SET_TRACK_POWER_OFF: (u8, u8) = (0x21, 0x80);
 const X_SET_TRACK_POWER_ON: (u8, u8) = (0x21, 0x81);
 const X_BC_TRACK_POWER: u8 = 0x61;
 
 /// Default timeout in milliseconds for awaiting responses.
 const DEFAULT_TIMEOUT_MS: u64 = 2000;
+
+/// Default broadcast flags for the Z21 station.(Default is ONLY LOCO_INFO & TURNOUT_INFO)
+const DEFAULT_BROADCAST_FLAGS: u32 = 0x00000001;
 
 /// Represents an asynchronous connection to a Z21 station.
 ///
@@ -45,6 +50,8 @@ pub struct Z21Station {
     message_sender: broadcast::Sender<Packet>,
     message_receiver: broadcast::Receiver<Packet>,
     timeout: Duration,
+    keep_alive: Arc<AtomicBool>,
+    broadcast_flags: u32,
 }
 
 impl Z21Station {
@@ -74,13 +81,25 @@ impl Z21Station {
             socket,
             message_sender: tx,
             message_receiver: rx,
+            keep_alive: Arc::new(AtomicBool::new(true)),
+            broadcast_flags: DEFAULT_BROADCAST_FLAGS,
             timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
         };
         // Start the background receiver task.
         station.start_receiver();
-        // Send an initial broadcast packet to announce presence.
-        let broadcast_packet = Packet::with_header_and_data(0x50, &u16::MAX.to_le_bytes());
-        station.send_packet(broadcast_packet).await?;
+
+        // Perform the initial handshake with the Z21 station.
+        let result = station.initial_handshake().await;
+        if let Err(e) = result {
+            eprintln!(
+                "There is no connection to the Z21 station, on the specified address: {}",
+                bind_addr
+            );
+            return Err(e);
+        }
+
+        // Start the keep-alive thread.
+        station.start_keep_alive_setup_broadcast_task();
         Ok(station)
     }
 
@@ -101,7 +120,21 @@ impl Z21Station {
                         let data = buf[..size].to_vec();
                         // Convert the raw data into a Packet.
                         let packet = Packet::from(data);
-                        println!("Received packet with header: {:?}", packet.get_header());
+                        //println!("Received packet with header: {:?}", packet.get_header());
+                        // if packet.get_header() == 64 {
+                        //     let xbus_msg = XBusMessage::try_from(
+                        //         &packet.get_data()[0..packet.get_data_len() as usize - 4],
+                        //     );
+                        //     if let Ok(msg) = xbus_msg {
+                        //         println!(
+                        //             "Received XBus message with header: {:02x}",
+                        //             msg.get_x_header()
+                        //         );
+                        //     } else {
+                        //         eprintln!("Failed to parse XBus message");
+                        //     }
+                        // }
+
                         // Broadcast the packet to all subscribers.
                         if let Err(e) = message_sender.send(packet) {
                             eprintln!("Failed to send packet via broadcast channel: {:?}", e);
@@ -111,6 +144,40 @@ impl Z21Station {
                         eprintln!("Error receiving packet: {:?}", e);
                         break;
                     }
+                }
+            }
+        });
+    }
+
+    async fn initial_handshake(&self) -> io::Result<()> {
+        let packet = Packet::with_header_and_data(LAN_SYSTEMSTATE_GETDATA, &[]);
+        self.send_packet(packet).await?;
+        let _ = self
+            .receive_packet_with_header(LAN_SYSTEMSTATE_DATACHANGED)
+            .await?;
+        Ok(())
+    }
+
+    async fn send_set_broadcast_flags(socket: &Arc<UdpSocket>, flags: u32) -> io::Result<()> {
+        let flags = flags.to_le_bytes();
+        let broadcast_packet = Packet::with_header_and_data(LAN_SET_BROADCASTFLAGS, &flags);
+        let broadcast_packet: Vec<_> = broadcast_packet.into();
+        socket.send(&broadcast_packet).await?;
+        Ok(())
+    }
+
+    /// Keeps connection alive by sending a broadcast packet to the Z21 station.
+    fn start_keep_alive_setup_broadcast_task(&self) {
+        let socket = Arc::clone(&self.socket);
+        let flags = self.broadcast_flags;
+        let keep_alive = Arc::clone(&self.keep_alive);
+        tokio::spawn(async move {
+            loop {
+                let _result = Self::send_set_broadcast_flags(&socket, flags).await;
+                tokio::time::sleep(Duration::from_secs(10)).await;
+
+                if !keep_alive.load(Ordering::Relaxed) {
+                    break;
                 }
             }
         });
@@ -131,6 +198,12 @@ impl Z21Station {
         let data: Vec<u8> = packet.into();
         // Send the serialized packet through the connected UDP socket.
         self.socket.send(&data).await?;
+        Ok(())
+    }
+    async fn send_packet_external(socket: &Arc<UdpSocket>, packet: Packet) -> io::Result<()> {
+        let data: Vec<u8> = packet.into();
+        // Send the serialized packet through the connected UDP socket.
+        socket.send(&data).await?;
         Ok(())
     }
 
@@ -328,6 +401,48 @@ impl Z21Station {
         Ok(u32::from_le_bytes([data[0], data[1], data[2], data[3]]))
     }
 
+    pub fn subscribe_system_state(
+        &self,
+        freq_in_sec: f64,
+        subscriber: Box<dyn Fn(SystemState) + Send + Sync>,
+    ) {
+        let mut receiver = self.message_receiver.resubscribe();
+        let socket = Arc::clone(&self.socket);
+        let keep_alive = Arc::clone(&self.keep_alive);
+        let packet = Packet::with_header_and_data(LAN_SYSTEMSTATE_GETDATA, &[]);
+        tokio::spawn(async move {
+            loop {
+                let result = Self::send_packet_external(&socket, packet.clone()).await;
+                if let Err(_) = result {
+                    break;
+                }
+
+                time::sleep(Duration::from_millis((1000. / freq_in_sec) as u64)).await;
+
+                if !keep_alive.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
+        });
+        tokio::spawn(async move {
+            loop {
+                match receiver.recv().await {
+                    Ok(packet) => {
+                        if packet.get_header() == LAN_SYSTEMSTATE_DATACHANGED {
+                            let state = SystemState::try_from(&packet.get_data()[..]);
+                            if let Ok(state) = state {
+                                subscriber(state);
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
     /// Logs out from the Z21 station by sending a logout command.
     /// It should be called at the end of the session to terminate the connection gracefully.
     ///
@@ -337,5 +452,11 @@ impl Z21Station {
     pub async fn logout(&self) -> io::Result<()> {
         let packet = Packet::with_header_and_data(0x30, &[]);
         self.send_packet(packet).await
+    }
+}
+
+impl Drop for Z21Station {
+    fn drop(&mut self) {
+        self.keep_alive.store(false, Ordering::Relaxed);
     }
 }
