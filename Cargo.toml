@@ -2,6 +2,15 @@
 name = "z21_api"
 version = "0.1.0"
 edition = "2021"
+repository = "https://github.com/atomwoz/rust_z21_api"
+authors = ["atomwoz <atwozniak67@gmail.com>"]
+description = "Rust API for Roco Z21 model railway control system"
+license = "BSD-3-Clause"
+readme = "README.md"
+keywords = ["z21", "roco", "fleischmann", "railway", "dcc"]
+
+[lib]
+name = "roco_z21_driver"
 
 [dependencies]
 tokio = { version ="1.43.0", features = ["full"] }

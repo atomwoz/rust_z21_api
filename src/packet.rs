@@ -14,7 +14,7 @@ impl Packet {
 
         let calculated_len = (data.len() + 4) as u16;
         Packet {
-            header: header,
+            header,
             data_len: calculated_len,
             data: Vec::from(data),
         }
@@ -30,12 +30,12 @@ impl Packet {
     }
 }
 
-impl Into<Vec<u8>> for Packet {
-    fn into(self) -> Vec<u8> {
+impl From<Packet> for Vec<u8> {
+    fn from(val: Packet) -> Self {
         let mut result = Vec::new();
-        result.extend(&self.data_len.to_le_bytes());
-        result.extend(&self.header.to_le_bytes());
-        result.extend(&self.data);
+        result.extend(&val.data_len.to_le_bytes());
+        result.extend(&val.header.to_le_bytes());
+        result.extend(&val.data);
         result
     }
 }
@@ -44,11 +44,11 @@ impl From<Vec<u8>> for Packet {
     fn from(data: Vec<u8>) -> Packet {
         let data_len = u16::from_le_bytes([data[0], data[1]]);
         let header = u16::from_le_bytes([data[2], data[3]]);
-        let payload = data[4..].to_vec();
+        let data = data[4..].to_vec();
         Packet {
-            data_len: data_len,
-            header: header,
-            data: payload,
+            data_len,
+            header,
+            data,
         }
     }
 }

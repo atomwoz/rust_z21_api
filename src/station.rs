@@ -1,18 +1,23 @@
-//! This module provides asynchronous communication with a RoCo Fleischmann Z21 station.
-//! It implements a reusable UDP-based API that handles sending commands and receiving
-//! events from the Z21 station. In particular, it supports receiving system state change
-//! events (LAN_SYSTEMSTATE_DATACHANGED) through an internal broadcast channel.
+//! # Z21Station
 //!
-//! # Overview
+//! The `Z21Station` module provides asynchronous communication with a Roco Fleischmann Z21
+//! digital command control (DCC) station for model railways.
 //!
-//! - Uses Tokio's asynchronous UDP socket for communication.
-//! - Wraps incoming messages in a [`Packet`] structure, and propagates them via a broadcast channel.
-//! - Provides helper methods for specific commands, e.g., turning voltage off, retrieving serial numbers,
-//!   and logging out.
-//! - The UDP socket is wrapped in an `Arc` for safe sharing across asynchronous tasks.
+//! ## Overview
+//!
+//! This module implements a complete UDP-based API for interacting with the Z21 station,
+//! handling command transmission and event reception through an asynchronous architecture.
+//! It supports:
+//!
+//! - Automatic connection management with keep-alive functionality
+//! - Broadcast message handling for system state changes and locomotive information
+//! - DCC command transmission for controlling locomotives and accessories
+//! - XBus protocol implementation for low-level communication
+//!
 
 use crate::messages::{self, SystemState, XBusMessage};
 use crate::packet::Packet;
+use std::cell::OnceCell;
 use std::convert::TryFrom;
 use std::io;
 use std::net::SocketAddr;
@@ -55,17 +60,31 @@ pub struct Z21Station {
 }
 
 impl Z21Station {
-    /// Creates a new `Z21Station` instance and initializes the connection to the specified
-    /// Z21 station address.
+    /// Creates a new connection to a Z21 station at the specified address.
+    ///
+    /// This method establishes a UDP connection to the Z21 station, performs the initial
+    /// handshake, and starts background tasks for maintaining the connection.
     ///
     /// # Arguments
     ///
-    /// * `bind_addr` - The target address of the Z21 station (default is `"192.168.0.111:21105"`).
+    /// * `bind_addr` - Network address of the Z21 station (typically "192.168.0.111:21105")
+    ///
+    /// # Returns
+    ///
+    /// A new `Z21Station` instance if the connection is successful.
     ///
     /// # Errors
     ///
-    /// Returns an `io::Error` if any step of the initialization fails, such as binding the socket,
-    /// enabling broadcast, or connecting to the target address.
+    /// Returns an `io::Error` if:
+    /// - The UDP socket cannot be bound or connected
+    /// - The initial handshake with the Z21 station fails
+    /// - The station does not respond within the timeout period
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// let station = Z21Station::new("192.168.0.111:21105").await?;
+    /// ```
     pub async fn new(bind_addr: &str) -> io::Result<Self> {
         // Bind the socket to an available local port on all interfaces.
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
@@ -351,11 +370,25 @@ impl Z21Station {
         }
     }
 
-    /// Turns off the track voltage - same as pressing STOP on the Z21 station / MultiMaus.
+    /// Turns off the track voltage.
+    ///
+    /// This is equivalent to pressing the STOP button on the Z21 station or the MultiMaus
+    /// controller. It cuts power to all tracks, stopping all locomotives immediately.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if the command was successfully sent and acknowledged.
     ///
     /// # Errors
     ///
-    /// Returns an `io::Error` if the command packet fails to send.
+    /// Returns an `io::Error` if the command fails to send or no acknowledgment is received.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// // Emergency stop all locomotives by cutting track power
+    /// station.voltage_off().await?;
+    /// ```
     pub async fn voltage_off(&self) -> io::Result<()> {
         self.send_xbus_command(
             XBusMessage::new_single(X_SET_TRACK_POWER_OFF.0, X_SET_TRACK_POWER_OFF.1),
@@ -365,11 +398,25 @@ impl Z21Station {
         Ok(())
     }
 
-    /// Turns on the track voltage - turning off programming mode, and disabling EMERG STOP from MultiMaus or button on Z21.
+    /// Turns on the track voltage.
+    ///
+    /// This restores power to the tracks after an emergency stop or when the system
+    /// is first started. It also disables programming mode if it was active.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if the command was successfully sent and acknowledged.
     ///
     /// # Errors
     ///
-    /// Returns an `io::Error` if the command packet fails to send.
+    /// Returns an `io::Error` if the command fails to send or no acknowledgment is received.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// // Restore power to the tracks
+    /// station.voltage_on().await?;
+    /// ```
     pub async fn voltage_on(&self) -> io::Result<()> {
         self.send_xbus_command(
             XBusMessage::new_single(X_SET_TRACK_POWER_ON.0, X_SET_TRACK_POWER_ON.1),
@@ -379,14 +426,25 @@ impl Z21Station {
         Ok(())
     }
 
-    /// Retrieves the serial number from the Z21 station as 32-bit unsigned integer.
+    /// Retrieves the serial number from the Z21 station.
+    ///
+    /// # Returns
+    ///
+    /// The Z21 station's serial number as a 32-bit unsigned integer.
     ///
     /// # Errors
     ///
     /// Returns an `io::Error` if:
-    /// - Sending the request fails.
-    /// - The response times out.
-    /// - The response data is invalid (e.g., too short).
+    /// - Sending the request fails
+    /// - The response times out
+    /// - The response data is invalid (e.g., too short)
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// let serial = station.get_serial_number().await?;
+    /// println!("Z21 station serial number: {}", serial);
+    /// ```
     pub async fn get_serial_number(&self) -> io::Result<u32> {
         let packet = Packet::with_header_and_data(0x10, &[]);
         self.send_packet(packet).await?;
@@ -401,6 +459,26 @@ impl Z21Station {
         Ok(u32::from_le_bytes([data[0], data[1], data[2], data[3]]))
     }
 
+    /// Subscribes to system state updates from the Z21 station.
+    ///
+    /// This method sets up a polling mechanism to regularly request system state updates
+    /// and calls the provided callback function whenever new state information is received.
+    ///
+    /// # Arguments
+    ///
+    /// * `freq_in_sec` - Polling frequency in Hz (updates per second)
+    /// * `subscriber` - Callback function that receives `SystemState` updates
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// station.subscribe_system_state(1.0, Box::new(|state| {
+    ///     println!("Main track voltage: {:.2}V", state.main_track_voltage);
+    ///     println!("Temperature: {}°C", state.temperature);
+    ///     println!("Current: {}mA", state.current);
+    /// }));
+    /// ```
+
     pub fn subscribe_system_state(
         &self,
         freq_in_sec: f64,
@@ -413,7 +491,7 @@ impl Z21Station {
         tokio::spawn(async move {
             loop {
                 let result = Self::send_packet_external(&socket, packet.clone()).await;
-                if let Err(_) = result {
+                if result.is_err() {
                     break;
                 }
 
@@ -425,30 +503,36 @@ impl Z21Station {
             }
         });
         tokio::spawn(async move {
-            loop {
-                match receiver.recv().await {
-                    Ok(packet) => {
-                        if packet.get_header() == LAN_SYSTEMSTATE_DATACHANGED {
-                            let state = SystemState::try_from(&packet.get_data()[..]);
-                            if let Ok(state) = state {
-                                subscriber(state);
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        break;
+            while let Ok(packet) = receiver.recv().await {
+                if packet.get_header() == LAN_SYSTEMSTATE_DATACHANGED {
+                    let state = SystemState::try_from(&packet.get_data()[..]);
+                    if let Ok(state) = state {
+                        subscriber(state);
                     }
                 }
             }
         });
     }
 
-    /// Logs out from the Z21 station by sending a logout command.
-    /// It should be called at the end of the session to terminate the connection gracefully.
+    /// Logs out from the Z21 station.
+    ///
+    /// This method should be called at the end of a session to gracefully terminate
+    /// the connection with the Z21 station.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if the logout command was successfully sent.
     ///
     /// # Errors
     ///
     /// Returns an `io::Error` if the logout command fails to send.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// // Clean up and disconnect from the Z21 station
+    /// station.logout().await?;
+    /// ```
     pub async fn logout(&self) -> io::Result<()> {
         let packet = Packet::with_header_and_data(0x30, &[]);
         self.send_packet(packet).await
