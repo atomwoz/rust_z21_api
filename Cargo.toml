@@ -1,6 +1,6 @@
 [package]
-name = "z21_api"
-version = "0.1.0"
+name = "roco_z21_driver"
+version = "0.1.1"
 edition = "2021"
 repository = "https://github.com/atomwoz/rust_z21_api"
 authors = ["atomwoz <atwozniak67@gmail.com>"]

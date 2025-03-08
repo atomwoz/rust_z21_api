@@ -1,8 +1,8 @@
 # Z21Station
 
-[![Crates.io](https://img.shields.io/crates/v/z21_driver.svg)](https://crates.io/crates/z21_driver)
-[![Documentation](https://docs.rs/z21_driver/badge.svg)](https://docs.rs/z21_driver)
-[![MIT/Apache-2.0 licensed](https://img.shields.io/crates/l/z21_driver.svg)](./LICENSE)
+[![Crates.io](https://img.shields.io/crates/v/z21_driver.svg)](https://crates.io/crates/roco_z21_driver)
+[![Documentation](https://docs.rs/roco_z21_driver/badge.svg)](https://docs.rs/roco_z21_driver)
+[![MIT/Apache-2.0 licensed](https://img.shields.io/crates/l/roco_z21_driver.svg)](./LICENSE)
 
 A Rust library for asynchronous communication with a Roco Fleischmann Z21 digital command control (DCC) station for model railways.
 
